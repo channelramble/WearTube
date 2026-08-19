@@ -240,7 +240,12 @@ fun PlayerScreen(videoId: String, onOpenDetails: (String) -> Unit) {
 
         error?.let { msg ->
             Column(
-                Modifier.fillMaxSize().padding(horizontal = 20.dp),
+                Modifier
+                    .fillMaxSize()
+                    // opaque: the video title and controls sit underneath and were
+                    // legible through the old transparent panel, overlapping the text
+                    .background(androidx.compose.ui.graphics.Color.Black)
+                    .padding(horizontal = 20.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.Center,
             ) {

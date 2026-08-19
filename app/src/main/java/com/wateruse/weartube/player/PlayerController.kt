@@ -74,12 +74,15 @@ object PlayerController {
     private val _isLoading = MutableStateFlow(false)
     val isLoading: StateFlow<Boolean> = _isLoading
 
+    private var stallWatchdog: Job? = null
+    private var downshifts = 0
     private var queue: MutableList<Video> = mutableListOf()
     private var recoveries = 0
     private var positionJob: Job? = null
     private var pendingPlay: Video? = null
 
     private const val MAX_RECOVERIES = 3
+    private const val MAX_DOWNSHIFTS = 3
 
     fun ensureService(context: Context) {
         if (player == null) {
@@ -127,7 +130,10 @@ object PlayerController {
         override fun onPlayerError(error: PlaybackException) {
             val v = _nowPlaying.value ?: return
             if (recoveries >= MAX_RECOVERIES) {
-                _error.value = "Playback failed: ${error.errorCodeName}"
+                // Prefer the reason we actually diagnosed. ExoPlayer wraps our
+                // PlaybackBlockedException several layers deep and its own
+                // errorCodeName ("ERROR_CODE_IO_UNSPECIFIED") tells the user nothing.
+                _error.value = rootReason(error) ?: "Playback failed: ${error.errorCodeName}"
                 return
             }
             recoveries++
@@ -153,6 +159,16 @@ object PlayerController {
         }
     }
 
+    /** Deepest message we raised ourselves, if any, from a wrapped ExoPlayer error. */
+    private fun rootReason(e: Throwable): String? {
+        var cur: Throwable? = e
+        while (cur != null) {
+            if (cur is com.wateruse.weartube.data.PlaybackBlockedException) return cur.message
+            cur = cur.cause
+        }
+        return null
+    }
+
     /** Start playing a video; [withQueue] replaces the queue (e.g. playlist Play All). */
     fun play(video: Video, withQueue: List<Video>? = null) {
         val p = player
@@ -161,6 +177,7 @@ object PlayerController {
             return
         }
         recoveries = 0
+        downshifts = 0
         StreamUrls.forget(video.id)
         _error.value = null
         _isLoading.value = true
@@ -217,6 +234,7 @@ object PlayerController {
         p.playWhenReady = true
         _isLoading.value = false
         startPositionSaver(video.id)
+        startStallWatchdog(video)
     }
 
     /**
@@ -226,6 +244,79 @@ object PlayerController {
      * MediaItem held the raw URL there would be nothing to swap it for mid-play.
      * RangedDataSource resolves wt:// per read and rotates underneath (StreamUrls).
      */
+    /**
+     * Steps quality down when the stream cannot be sustained.
+     *
+     * A googlevideo URL yields only a few hundred KB before refusing, and fresh
+     * URLs can only be requested every few seconds without tripping bot checks.
+     * That puts a hard ceiling on deliverable bitrate: measured on the Ultra 2,
+     * 480p (~150KB/s) needs a new URL roughly every 1.5s against a 4s floor, so it
+     * buffers forever — position frozen, dozens of rotations, no recovery. 360p and
+     * below fit comfortably. Rather than let the user pick a setting that bricks
+     * playback, detect the stall and drop a rung.
+     */
+    private fun startStallWatchdog(video: Video) {
+        stallWatchdog?.cancel()
+        stallWatchdog = scope.launch {
+            var lastPos = -1L
+            var stuckSince = 0L
+            while (isActive) {
+                delay(3_000)
+                val p = player ?: continue
+                val pos = p.currentPosition
+                val buffering = p.playbackState == Player.STATE_BUFFERING
+                if (buffering && p.playWhenReady && pos == lastPos) {
+                    if (stuckSince == 0L) stuckSince = System.currentTimeMillis()
+                    if (System.currentTimeMillis() - stuckSince >= 12_000) {
+                        stuckSince = 0L
+                        if (!downshift(video)) {
+                            _error.value =
+                                if (StreamUrls.looksRateLimited())
+                                    "YouTube is rate-limiting this network. Try again later."
+                                else "Stream won't keep up on this connection."
+                            player?.pause()   // stop burning requests on a dead stream
+                        }
+                    }
+                } else {
+                    stuckSince = 0L
+                }
+                lastPos = pos
+            }
+        }
+    }
+
+    /**
+     * Drop to the next lower rendition; false when there is nowhere lower to go.
+     *
+     * Two guards matter here. Picking a rung equal to the current one re-prepares
+     * the same stream forever — at audio-only the "next lower" search used to
+     * return audio-only itself, which looped every 12s and poured player-API calls
+     * into an already-throttled connection (measured: 14 downshifts, 70 API calls,
+     * position frozen). And a stall that survives a few steps down is not a bitrate
+     * problem at all — it is the network refusing us — so stepping further only
+     * makes that worse.
+     */
+    private fun downshift(video: Video): Boolean {
+        if (downshifts >= MAX_DOWNSHIFTS) return false
+        val b = _bundle.value ?: return false
+        val current = _choice.value ?: return false
+        val lower = b.choices
+            .filter { it.height in 1 until current.height }
+            .maxByOrNull { it.height }
+            ?: b.choices.firstOrNull { it.height == 0 }
+            ?: return false
+        // already at the bottom rung: nothing to gain by re-preparing it
+        if (lower.height == current.height) return false
+        downshifts++
+        android.util.Log.w(
+            "WTStream",
+            "stalled at ${current.label}; stepping down to ${lower.label} ($downshifts/$MAX_DOWNSHIFTS)"
+        )
+        Settings.preferredHeight = if (lower.height == 0) 0 else lower.height
+        applyChoice(lower)
+        return true
+    }
+
     private fun buildSource(sel: StreamChoice, meta: MediaMetadata, videoId: String): MediaSource {
         val factory = ProgressiveMediaSource.Factory(RangedDataSource.Factory())
         fun item(uri: String) = MediaItem.Builder().setUri(uri).setMediaMetadata(meta).build()
@@ -265,6 +356,7 @@ object PlayerController {
 
     fun stop() {
         saveCurrentPosition()
+        stallWatchdog?.cancel()
         positionJob?.cancel()
         player?.stop()
         player?.clearMediaItems()

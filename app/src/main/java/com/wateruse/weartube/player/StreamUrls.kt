@@ -69,6 +69,20 @@ object StreamUrls {
     private val lastCallAt = HashMap<String, Long>()
     private val callLock = Any()
 
+    /**
+     * The most recent player response per video, with the time it landed.
+     *
+     * ONE player call returns URLs for EVERY track, so a rotation triggered by the
+     * video track can also serve the audio track. Without this the two tracks
+     * alternate through the per-video pace gate — VIDEO at t, AUDIO at t+4s, VIDEO
+     * at t+8s — so each track is refreshed only every 8s. At 480p a URL's budget
+     * lasts ~3-4s, so playback starved permanently (measured on the Ultra 2:
+     * 33 rotations, position frozen at 1:55). Sharing the response fixes the
+     * starvation AND halves player-API traffic.
+     */
+    private val recentBundle = HashMap<String, Pair<Long, com.wateruse.weartube.data.StreamBundle>>()
+    private const val BUNDLE_REUSE_MS = 3_000L
+
     private fun paceCall(videoId: String, gapMs: Long) {
         val waitMs: Long
         synchronized(callLock) {
@@ -87,6 +101,7 @@ object StreamUrls {
 
     fun forget(videoId: String) {
         synchronized(lock) { states.keys.removeAll { it.startsWith("$videoId|") } }
+        synchronized(callLock) { recentBundle.remove(videoId) }
         clearRateLimit()
     }
 
@@ -101,6 +116,12 @@ object StreamUrls {
     // Rate-limit detection: fresh URLs refusing before serving any bytes.
     private var freshRefusals = 0
     private var freshRefusalWindowStart = 0L
+    /**
+     * Once tripped, stays tripped for a while. The rolling counter alone reset
+     * between the refusals and the moment the UI asked, so a genuinely
+     * rate-limited stream reported the generic "won't keep up" message instead.
+     */
+    private var rateLimitedUntil = 0L
 
     fun noteRateLimited() = synchronized(callLock) {
         val now = System.currentTimeMillis()
@@ -109,12 +130,14 @@ object StreamUrls {
             freshRefusals = 0
         }
         freshRefusals++
+        if (freshRefusals >= 3) rateLimitedUntil = now + 120_000
     }
 
     /** Three fresh URLs refused within a minute: the network is flagged, not us. */
-    fun looksRateLimited(): Boolean = synchronized(callLock) { freshRefusals >= 3 }
+    fun looksRateLimited(): Boolean =
+        synchronized(callLock) { freshRefusals >= 3 || System.currentTimeMillis() < rateLimitedUntil }
 
-    fun clearRateLimit() = synchronized(callLock) { freshRefusals = 0 }
+    fun clearRateLimit() = synchronized(callLock) { freshRefusals = 0; rateLimitedUntil = 0 }
 
     /**
      * The URL to use for the next read of [count] bytes, rotating first if this
@@ -135,7 +158,7 @@ object StreamUrls {
                     st.spare = null
                     st.budgetUsed = 0
                 } else {
-                    val fresh = fetchFresh(videoId, kind, height)
+                    val fresh = fetchFresh(videoId, kind, height, replacing = st.url)
                     if (fresh != null) {
                         st.url = fresh
                         st.budgetUsed = 0
@@ -176,7 +199,7 @@ object StreamUrls {
                 st.budgetUsed = 0
                 return true
             }
-            val fresh = fetchFresh(videoId, kind, height) ?: return false
+            val fresh = fetchFresh(videoId, kind, height, replacing = st.url) ?: return false
             st.url = fresh
             st.budgetUsed = 0
             return true
@@ -188,7 +211,8 @@ object StreamUrls {
         if (st.budgetUsed <= st.budget * 3 / 4) return
         st.prefetching = true
         Thread {
-            val url = try { fetchFresh(videoId, kind, height, prefetch = true) } finally { }
+            val cur = synchronized(st) { st.url }
+            val url = fetchFresh(videoId, kind, height, prefetch = true, replacing = cur)
             synchronized(st) {
                 if (url != null) st.spare = url
                 st.prefetching = false
@@ -196,22 +220,58 @@ object StreamUrls {
         }.apply { isDaemon = true }.start()
     }
 
+    private fun urlFrom(
+        bundle: com.wateruse.weartube.data.StreamBundle,
+        kind: Kind,
+        height: Int,
+    ): String? {
+        val choice = bundle.choices.firstOrNull { it.height == height } ?: bundle.choices.firstOrNull()
+        return when (kind) {
+            Kind.VIDEO -> choice?.videoUrl
+            Kind.AUDIO -> choice?.audioUrl ?: bundle.choices.firstNotNullOfOrNull { it.audioUrl }
+            Kind.PROGRESSIVE -> choice?.muxedUrl
+        }
+    }
+
     /**
      * Re-resolve the video and pick the URL for this track. Rate limited per
      * video; StreamResolver coalesces genuinely concurrent callers.
      */
-    private fun fetchFresh(videoId: String, kind: Kind, height: Int, prefetch: Boolean = false): String? {
+    private fun fetchFresh(
+        videoId: String,
+        kind: Kind,
+        height: Int,
+        prefetch: Boolean = false,
+        replacing: String? = null,
+    ): String? {
+        // A sibling track may have just re-resolved this video; its URLs are ours too.
+        synchronized(callLock) {
+            recentBundle[videoId]?.let { (at, b) ->
+                if (System.currentTimeMillis() - at < BUNDLE_REUSE_MS) {
+                    // Never hand back the URL we are replacing: a shared bundle holds
+                    // one URL per track, so reusing it for the track that just spent
+                    // that URL returns the dead one and 403s instantly.
+                    urlFrom(b, kind, height)?.takeIf { it != replacing }?.let {
+                        Log.i("WTStream", "reused fresh bundle for $kind ${height}p ($videoId)")
+                        return it
+                    }
+                }
+            }
+        }
         paceCall(videoId, if (prefetch) PREFETCH_MIN_GAP_MS else ROTATE_MIN_GAP_MS)
+        // Re-check: while we waited on the pace gate, a sibling may have resolved.
+        synchronized(callLock) {
+            recentBundle[videoId]?.let { (at, b) ->
+                if (System.currentTimeMillis() - at < BUNDLE_REUSE_MS) {
+                    urlFrom(b, kind, height)?.takeIf { it != replacing }?.let { return it }
+                }
+            }
+        }
         return try {
             val bundle = runBlocking { StreamResolver.resolve(videoId, forceFresh = true) }
+            synchronized(callLock) { recentBundle[videoId] = System.currentTimeMillis() to bundle }
             RangedDataSource.streamUserAgent = bundle.streamUa.ifEmpty { RangedDataSource.streamUserAgent }
-            val choice = bundle.choices.firstOrNull { it.height == height }
-                ?: bundle.choices.firstOrNull()
-            val url = when (kind) {
-                Kind.VIDEO -> choice?.videoUrl
-                Kind.AUDIO -> choice?.audioUrl ?: bundle.choices.firstNotNullOfOrNull { it.audioUrl }
-                Kind.PROGRESSIVE -> choice?.muxedUrl
-            }
+            val url = urlFrom(bundle, kind, height)
             Log.i("WTStream", "rotated $kind ${height}p for $videoId -> ${if (url != null) "ok" else "MISS"}")
             url
         } catch (e: Exception) {
