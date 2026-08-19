@@ -312,8 +312,7 @@ object PlayerController {
             "WTStream",
             "stalled at ${current.label}; stepping down to ${lower.label} ($downshifts/$MAX_DOWNSHIFTS)"
         )
-        Settings.preferredHeight = if (lower.height == 0) 0 else lower.height
-        applyChoice(lower)
+        applyChoice(lower, persist = false)
         return true
     }
 
@@ -332,16 +331,26 @@ object PlayerController {
         }
     }
 
-    /** Switch rendition (quality/audio-only) in place, keeping position. */
-    fun applyChoice(sel: StreamChoice) {
+    /**
+     * Switch rendition in place, keeping position.
+     *
+     * [persist] must be false for automatic changes. An auto-downshift that wrote
+     * the setting turned a momentary network dip into a permanent preference —
+     * after one stall the app played audio-only for every video afterwards, with
+     * nothing on screen explaining why. Only an explicit pick in the quality menu
+     * changes what the user has chosen.
+     */
+    fun applyChoice(sel: StreamChoice, persist: Boolean = true) {
         val p = player ?: return
         val v = _nowPlaying.value ?: return
         val b = _bundle.value ?: return
         val pos = p.currentPosition
         val wasPlaying = p.playWhenReady
         _choice.value = sel
-        Settings.audioOnly = sel.height == 0
-        if (sel.height > 0) Settings.preferredHeight = if (sel.muxedUrl != null) 0 else sel.height
+        if (persist) {
+            Settings.audioOnly = sel.height == 0
+            if (sel.height > 0) Settings.preferredHeight = if (sel.muxedUrl != null) 0 else sel.height
+        }
         val meta = MediaMetadata.Builder().setTitle(b.title).setArtist(b.channel).build()
         p.setMediaSource(buildSource(sel, meta, v.id))
         p.prepare()
