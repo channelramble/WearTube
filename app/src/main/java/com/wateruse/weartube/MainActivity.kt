@@ -35,6 +35,17 @@ import java.net.URLDecoder
 import java.net.URLEncoder
 
 class MainActivity : ComponentActivity() {
+
+    override fun onNewIntent(newIntent: android.content.Intent) {
+        super.onNewIntent(newIntent)
+        // keep the activity's stored intent free of one-shot debug extras
+        newIntent.removeExtra("open_video")
+        newIntent.removeExtra("open_playlist")
+        newIntent.removeExtra("open_channel")
+        newIntent.removeExtra("open_tab")
+        setIntent(newIntent)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Store.init(applicationContext)
@@ -51,11 +62,23 @@ class MainActivity : ComponentActivity() {
         }
         // silent token refresh; consent (if ever needed) only happens via the Library sign-in flow
         lifecycleScope.launch(Dispatchers.IO) { Auth.fetchToken(null) }
-        // debug hooks: adb shell am start ... --es open_video <videoId> / --es open_playlist <playlistId>
+        // Debug hooks: adb shell am start ... --es open_video <id> / open_playlist /
+        // open_channel / open_tab.
+        //
+        // These MUST be consumed. Android hands the activity the same launch intent
+        // again every time the task is resumed or the activity is recreated, so a
+        // leftover extra kept re-opening the last test video ("Me at the zoo") during
+        // ordinary use, looking like a random autoplay bug.
         val debugVideo = intent?.getStringExtra("open_video")
         val debugPlaylist = intent?.getStringExtra("open_playlist")
         val debugChannel = intent?.getStringExtra("open_channel")
         val debugTab = intent?.getStringExtra("open_tab")
+        intent?.apply {
+            removeExtra("open_video")
+            removeExtra("open_playlist")
+            removeExtra("open_channel")
+            removeExtra("open_tab")
+        }
         setContent {
             WearTubeTheme {
                 WearTubeNav(debugVideo, debugPlaylist, debugChannel, debugTab)

@@ -358,9 +358,47 @@ object PlayerController {
         p.playWhenReady = wasPlaying
     }
 
+    /**
+     * Advance to the next video. Works the same whether the app is on screen or
+     * backgrounded — the listener that calls this lives on the service's player.
+     *
+     * Previously this gave up silently when both the queue and the related list
+     * were empty, which is exactly what happens if the background related-fetch
+     * lost a race or failed on a flaky connection: the video ended and playback
+     * simply stopped. Now the list is fetched on demand before conceding, and
+     * anything just watched is skipped so autoplay cannot loop on one video.
+     */
     fun playNext() {
-        val next = queue.removeFirstOrNull() ?: _upNext.value.firstOrNull() ?: return
-        play(next)
+        val queued = queue.removeFirstOrNull()
+        if (queued != null) {
+            play(queued)
+            return
+        }
+        val current = _nowPlaying.value?.id
+        _upNext.value.firstOrNull { it.id != current }?.let {
+            android.util.Log.i("WTStream", "autoplay -> ${it.id} (from related)")
+            play(it)
+            return
+        }
+        // nothing in hand: fetch related now rather than ending playback
+        val videoId = current ?: return
+        scope.launch {
+            val rel = try {
+                Repo.related(videoId)
+            } catch (e: Exception) {
+                android.util.Log.w("WTStream", "autoplay related fetch failed: ${e.message}")
+                emptyList()
+            }
+            val recent = withContext(Dispatchers.IO) { Store.history().take(5).map { it.id }.toSet() }
+            val next = rel.firstOrNull { it.id != videoId && it.id !in recent }
+                ?: rel.firstOrNull { it.id != videoId }
+            if (next != null) {
+                android.util.Log.i("WTStream", "autoplay -> ${next.id} (fetched on demand)")
+                play(next)
+            } else {
+                android.util.Log.w("WTStream", "autoplay: nothing to play next")
+            }
+        }
     }
 
     fun stop() {

@@ -9,6 +9,9 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -17,6 +20,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -116,6 +120,8 @@ fun PlayerScreen(videoId: String, onOpenDetails: (String) -> Unit) {
     var positionMs by remember { mutableLongStateOf(0L) }
     var durationMs by remember { mutableLongStateOf(0L) }
     var speed by remember { mutableFloatStateOf(1f) }
+    var scrubbing by remember { mutableStateOf(false) }
+    var scrubFrac by remember { mutableFloatStateOf(0f) }
     val focusRequester = remember { FocusRequester() }
     val audio = remember { context.getSystemService(Context.AUDIO_SERVICE) as AudioManager }
 
@@ -151,7 +157,7 @@ fun PlayerScreen(videoId: String, onOpenDetails: (String) -> Unit) {
         while (isActive) {
             PlayerController.player?.let { p ->
                 isPlaying = p.isPlaying
-                positionMs = p.currentPosition
+                if (!scrubbing) positionMs = p.currentPosition
                 durationMs = p.duration.coerceAtLeast(0)
                 speed = p.playbackParameters.speed
             }
@@ -160,8 +166,8 @@ fun PlayerScreen(videoId: String, onOpenDetails: (String) -> Unit) {
     }
 
     // auto-hide controls while playing
-    LaunchedEffect(controlsVisible, isPlaying) {
-        if (controlsVisible && isPlaying) {
+    LaunchedEffect(controlsVisible, isPlaying, scrubbing) {
+        if (controlsVisible && isPlaying && !scrubbing) {
             delay(4000)
             controlsVisible = false
         }
@@ -358,17 +364,44 @@ fun PlayerScreen(videoId: String, onOpenDetails: (String) -> Unit) {
                         .padding(horizontal = 40.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
-                    // seek bar: tap position -> seek
+                    // Scrub bar: drag OR tap to seek.
+                    //
+                    // This was tap-only, on a 14dp strip with no thumb — effectively
+                    // un-hittable on a watch, and the controls hid after 4s while you
+                    // were still aiming. Now: a 30dp touch target (the visual bar stays
+                    // slim), a thumb that grows while dragging, live time preview, and
+                    // the seek is issued on release so a drag across a long video does
+                    // not fire dozens of seeks at a rate-limited stream.
+                    val shownFrac = if (scrubbing) scrubFrac
+                    else if (durationMs > 0) (positionMs.toFloat() / durationMs).coerceIn(0f, 1f)
+                    else 0f
                     Box(
                         Modifier
                             .fillMaxWidth()
-                            .height(14.dp)
+                            .height(30.dp)
                             .pointerInput(durationMs) {
-                                detectTapGestures { offset ->
-                                    if (durationMs > 0) {
-                                        val frac = (offset.x / size.width).coerceIn(0f, 1f)
-                                        PlayerController.player?.seekTo((durationMs * frac).toLong())
+                                // Wear's swipe-to-dismiss owns horizontal drags, and it
+                                // won the race against detectHorizontalDragGestures: a
+                                // drag on the bar navigated back to Home instead of
+                                // seeking (seen on the Ultra 2). Claiming the pointer on
+                                // the very first DOWN — before any touch-slop threshold —
+                                // keeps the gesture here. This also handles a plain tap,
+                                // since a down/up with no movement seeks to that point.
+                                awaitEachGesture {
+                                    val down = awaitFirstDown(requireUnconsumed = false)
+                                    if (durationMs <= 0) return@awaitEachGesture
+                                    down.consume()
+                                    scrubbing = true
+                                    scrubFrac = (down.position.x / size.width).coerceIn(0f, 1f)
+                                    while (true) {
+                                        val ev = awaitPointerEvent()
+                                        val c = ev.changes.firstOrNull { it.id == down.id } ?: break
+                                        scrubFrac = (c.position.x / size.width).coerceIn(0f, 1f)
+                                        c.consume()
+                                        if (!c.pressed) break
                                     }
+                                    PlayerController.player?.seekTo((durationMs * scrubFrac).toLong())
+                                    scrubbing = false
                                 }
                             },
                         contentAlignment = Alignment.CenterStart,
@@ -376,24 +409,37 @@ fun PlayerScreen(videoId: String, onOpenDetails: (String) -> Unit) {
                         Box(
                             Modifier
                                 .fillMaxWidth()
-                                .height(4.dp)
-                                .clip(RoundedCornerShape(2.dp))
+                                .height(if (scrubbing) 6.dp else 4.dp)
+                                .clip(RoundedCornerShape(3.dp))
                                 .background(Color(0x4DFFFFFF))
                         )
-                        if (durationMs > 0) {
+                        Box(
+                            Modifier
+                                .fillMaxWidth(shownFrac)
+                                .height(if (scrubbing) 6.dp else 4.dp)
+                                .clip(RoundedCornerShape(3.dp))
+                                .background(MaterialTheme.colors.primary)
+                        )
+                        // thumb, positioned at the played fraction
+                        androidx.compose.foundation.layout.BoxWithConstraints(
+                            Modifier.fillMaxWidth()
+                        ) {
+                            val thumb = if (scrubbing) 14.dp else 9.dp
                             Box(
                                 Modifier
-                                    .fillMaxWidth((positionMs.toFloat() / durationMs).coerceIn(0f, 1f))
-                                    .height(4.dp)
-                                    .clip(RoundedCornerShape(2.dp))
+                                    .offset(x = (maxWidth - thumb) * shownFrac)
+                                    .size(thumb)
+                                    .clip(RoundedCornerShape(thumb / 2))
                                     .background(MaterialTheme.colors.primary)
                             )
                         }
                     }
                     Text(
-                        "${formatTime(positionMs)} / ${formatTime(durationMs)}",
+                        if (scrubbing && durationMs > 0)
+                            "${formatTime((durationMs * scrubFrac).toLong())} / ${formatTime(durationMs)}"
+                        else "${formatTime(positionMs)} / ${formatTime(durationMs)}",
                         style = MaterialTheme.typography.caption3,
-                        color = MaterialTheme.colors.secondary,
+                        color = if (scrubbing) MaterialTheme.colors.primary else MaterialTheme.colors.secondary,
                     )
                     Row(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
